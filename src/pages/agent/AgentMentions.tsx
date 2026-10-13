@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState, type UIEvent as ReactUIEvent } from 'react'
 import { Button as HeroButton, Dropdown, Label, SearchField } from '@heroui/react'
 import { At, Persons, Xmark } from '@gravity-ui/icons'
 import type { UIMessage } from 'ai'
@@ -349,23 +349,36 @@ export function MentionTypeahead({
   query,
   sessions,
   isLoading,
+  isLoadingMore = false,
+  hasMore = false,
   activeIndex,
   onActiveIndexChange,
   onDismiss,
   onRequest,
+  onLoadMore,
   onSelect,
 }: {
   query: string
   sessions: MentionTarget[]
   isLoading: boolean
+  isLoadingMore?: boolean
+  hasMore?: boolean
   activeIndex: number
   onActiveIndexChange: (index: number) => void
   onDismiss: () => void
   onRequest?: (query: string) => void
+  onLoadMore?: (query: string) => void
   onSelect: (target: MentionTarget) => void
 }) {
   const panelRef = useRef<HTMLDivElement | null>(null)
-  const visible = filterMentionTargets(sessions, query)
+  const visible = filterMentionTargets(sessions, query, 1000)
+
+  const handleScroll = (event: ReactUIEvent<HTMLDivElement>) => {
+    const element = event.currentTarget
+    if (element.scrollHeight - element.scrollTop - element.clientHeight > 64) return
+    if (!hasMore || isLoading || isLoadingMore) return
+    onLoadMore?.(query.trim())
+  }
 
   useEffect(() => {
     const timer = window.setTimeout(() => onRequest?.(query.trim()), query.trim() ? 180 : 0)
@@ -394,30 +407,38 @@ export function MentionTypeahead({
         aria-label="提及联系人或群"
         className="agent-mention-typeahead__list"
         id="agent-mention-suggestions"
+        onScroll={handleScroll}
         role="listbox"
       >
         {isLoading && visible.length === 0 ? (
           <div aria-disabled="true" className="agent-mention-typeahead__status" role="option">正在查找…</div>
         ) : visible.length === 0 ? (
           <div aria-disabled="true" className="agent-mention-typeahead__status" role="option">未找到匹配对象</div>
-        ) : visible.map((target, index) => (
-          <button
-            aria-selected={index === activeIndex}
-            className="agent-mention-typeahead__option"
-            data-active={index === activeIndex ? 'true' : undefined}
-            id={`agent-mention-suggestion-${index}`}
-            key={target.username}
-            onClick={() => onSelect(target)}
-            onMouseDown={(event) => event.preventDefault()}
-            onMouseEnter={() => onActiveIndexChange(index)}
-            role="option"
-            type="button"
-          >
-            <MentionAvatar target={target} />
-            <span className="agent-mention-typeahead__name">{target.displayName}</span>
-            <span className="agent-mention-typeahead__kind">{targetKindLabel(target.kind)}</span>
-          </button>
-        ))}
+        ) : (
+          <>
+            {visible.map((target, index) => (
+              <button
+                aria-selected={index === activeIndex}
+                className="agent-mention-typeahead__option"
+                data-active={index === activeIndex ? 'true' : undefined}
+                id={`agent-mention-suggestion-${index}`}
+                key={target.username}
+                onClick={() => onSelect(target)}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => onActiveIndexChange(index)}
+                role="option"
+                type="button"
+              >
+                <MentionAvatar target={target} />
+                <span className="agent-mention-typeahead__name">{target.displayName}</span>
+                <span className="agent-mention-typeahead__kind">{targetKindLabel(target.kind)}</span>
+              </button>
+            ))}
+            {isLoadingMore && (
+              <div aria-disabled="true" className="agent-mention-typeahead__status" role="option">正在加载更多…</div>
+            )}
+          </>
+        )}
       </div>
       <div className="agent-mention-typeahead__hint">↑↓ 选择 · Enter 确认 · Esc 关闭</div>
     </div>
@@ -484,19 +505,32 @@ export function MentionTriggerButton({
   mentions,
   sessions,
   isLoading,
+  isLoadingMore = false,
+  hasMore = false,
   onAdd,
   onRequest,
+  onLoadMore,
 }: {
   mentions: MentionTarget[]
   sessions: MentionTarget[]
   isLoading: boolean
+  isLoadingMore?: boolean
+  hasMore?: boolean
   onAdd: (target: MentionTarget) => void
   onRequest?: (query: string) => void
+  onLoadMore?: (query: string) => void
 }) {
   const [isOpen, setIsOpen] = useState(false)
   const [search, setSearch] = useState('')
   const keyword = search.trim().toLowerCase()
-  const visible = filterMentionTargets(sessions, keyword)
+  const visible = filterMentionTargets(sessions, keyword, 1000)
+
+  const handleScroll = (event: ReactUIEvent<HTMLElement>) => {
+    const element = event.currentTarget
+    if (element.scrollHeight - element.scrollTop - element.clientHeight > 64) return
+    if (!hasMore || isLoading || isLoadingMore) return
+    onLoadMore?.(search.trim())
+  }
 
   useEffect(() => {
     if (!isOpen) return
@@ -538,8 +572,9 @@ export function MentionTriggerButton({
         <Dropdown.Menu
           aria-label="提及联系人或群"
           className="agent-scrollbar max-h-72 gap-1 overflow-y-auto p-1.5"
+          onScroll={handleScroll}
         >
-          {isLoading ? (
+          {isLoading && visible.length === 0 ? (
             <Dropdown.Item key="mention-loading" id="mention-loading" isDisabled textValue="联系人加载中">
               <Label>联系人加载中…</Label>
             </Dropdown.Item>
@@ -557,26 +592,33 @@ export function MentionTriggerButton({
               </span>
             </Dropdown.Item>
           ) : (
-            visible.map((target) => {
-              const selected = mentions.some((mention) => mention.username === target.username)
-              return (
-                <Dropdown.Item
-                  aria-selected={selected}
-                  className="min-h-12 rounded-xl px-2.5 py-2 data-[hovered=true]:bg-accent/10"
-                  id={`mention-target:${target.username}`}
-                  key={`mention-target:${target.username}`}
-                  textValue={target.displayName}
-                  onAction={() => {
-                    onAdd(target)
-                    setIsOpen(false)
-                  }}
-                >
-                  <MentionAvatar target={target} />
-                  <Label>{target.displayName}</Label>
-                  <span>{selected ? '已在范围内' : targetKindLabel(target.kind)}</span>
+            <>
+              {visible.map((target) => {
+                const selected = mentions.some((mention) => mention.username === target.username)
+                return (
+                  <Dropdown.Item
+                    aria-selected={selected}
+                    className="min-h-12 rounded-xl px-2.5 py-2 data-[hovered=true]:bg-accent/10"
+                    id={`mention-target:${target.username}`}
+                    key={`mention-target:${target.username}`}
+                    textValue={target.displayName}
+                    onAction={() => {
+                      onAdd(target)
+                      setIsOpen(false)
+                    }}
+                  >
+                    <MentionAvatar target={target} />
+                    <Label>{target.displayName}</Label>
+                    <span>{selected ? '已在范围内' : targetKindLabel(target.kind)}</span>
+                  </Dropdown.Item>
+                )
+              })}
+              {isLoadingMore && (
+                <Dropdown.Item key="mention-loading-more" id="mention-loading-more" isDisabled textValue="正在加载更多联系人">
+                  <Label>正在加载更多…</Label>
                 </Dropdown.Item>
-              )
-            })
+              )}
+            </>
           )}
         </Dropdown.Menu>
       </Dropdown.Popover>

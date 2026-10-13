@@ -1,4 +1,4 @@
-﻿import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import { basename, dirname, extname, join, resolve as resolvePath } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'fs'
@@ -7,7 +7,7 @@ import { homedir, tmpdir } from 'os'
 import crypto from 'crypto'
 import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
-import { decryptDatViaNativeAsync, nativeAddonLocation } from './nativeImageDecrypt'
+import { decryptDatViaNativeAsync, getNativeAddonDiagnostics, nativeAddonLocation } from './nativeImageDecrypt'
 
 // 获取 ffmpeg-static 的路径
 function getStaticFfmpegPath(): string | null {
@@ -244,13 +244,20 @@ export class ImageDecryptService {
   }
 
   private logError(message: string, error?: unknown, meta?: Record<string, unknown>): void {
-    if (!this.configService.get('logEnabled')) return
+    // 解密失败原因必须可诊断；即使用户关闭普通日志，也保留不含密钥的错误记录。
     const timestamp = new Date().toISOString()
     const errorStr = error ? ` Error: ${String(error)}` : ''
     const metaStr = meta ? ` ${JSON.stringify(meta)}` : ''
     const logLine = `[${timestamp}] [ImageDecrypt] ERROR: ${message}${errorStr}${metaStr}\n`
     console.error(message, error, meta)
     this.writeLog(logLine)
+  }
+
+  private logDiagnostic(message: string, meta?: Record<string, unknown>): void {
+    // 文件定位诊断不包含密钥；即使关闭普通日志也保留，便于确认数据库映射是否被路径校验丢弃。
+    const timestamp = new Date().toISOString()
+    const metaStr = meta ? ` ${JSON.stringify(meta)}` : ''
+    this.writeLog(`[${timestamp}] [ImageDecrypt] DIAG: ${message}${metaStr}\n`)
   }
 
   private writeLog(line: string): void {
@@ -640,7 +647,14 @@ export class ImageDecryptService {
       }
 
       if (!datPath) {
-        this.logError('未找到DAT文件', undefined, { md5: payload.imageMd5, datName: payload.imageDatName })
+        this.logError('未找到DAT文件', undefined, {
+          accountDir: context.accountDir,
+          sessionId: payload.sessionId,
+          createTime: payload.createTime,
+          md5: payload.imageMd5,
+          datName: payload.imageDatName,
+          usedHdAttempt
+        })
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', '未找到DAT文件')
         if (usedHdAttempt) {
           return { success: false, error: '未找到图片文件，请在目标应用中点开该图片后重试', failureKind: 'not_found' }
@@ -873,6 +887,8 @@ export class ImageDecryptService {
     const allowDatNameScanFallback = options?.allowDatNameScanFallback ?? true
     const allowFilesystemScan = options?.allowFilesystemScan !== false
     this.logInfo('[ImageDecrypt] resolveDatPath', {
+      accountDir,
+      sessionId,
       imageMd5,
       imageDatName,
       createTime,
@@ -884,6 +900,14 @@ export class ImageDecryptService {
     })
 
     const lookupBases = this.collectLookupBasesForScan(imageMd5, imageDatName, allowDatNameScanFallback)
+    this.logDiagnostic('resolveDatPath lookup', {
+      accountDir,
+      sessionId,
+      createTime,
+      imageMd5,
+      imageDatName,
+      lookupBases
+    })
     if (lookupBases.length === 0) {
       this.logInfo('[ImageDecrypt] resolveDatPath miss (no lookup base)', { imageMd5, imageDatName })
       return null
@@ -921,21 +945,26 @@ export class ImageDecryptService {
       }
     }
 
-    if (hardlinkOnly) {
-      for (const baseMd5 of lookupBases) {
-        if (!this.looksLikeMd5(baseMd5)) continue
-        const hardlinkPath = await this.resolveHardlinkPath(accountDir, baseMd5, sessionId)
-        if (!this.isOperationCurrent(context)) return null
-        if (!hardlinkPath) continue
-        if (!allowThumbnail && !this.isHdDatPath(hardlinkPath)) continue
-        this.cacheDatPath(accountDir, baseMd5, hardlinkPath, context)
-        if (imageMd5) this.cacheDatPath(accountDir, imageMd5, hardlinkPath, context)
-        if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hardlinkPath, context)
-        const normalizedFileName = basename(hardlinkPath).toLowerCase()
-        if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, hardlinkPath, context)
-        this.datNameScanMissAt.delete(missKey)
-        return hardlinkPath
-      }
+    // 新版缓存中的 DAT 文件名通常是随机 token，并不等于消息里的图片 MD5。
+    // 因此无论是否 hardlinkOnly，都要先通过 hardlink.db 把内容 MD5 映射到实际文件名。
+    for (const baseMd5 of lookupBases) {
+      if (!this.looksLikeMd5(baseMd5)) continue
+      const hardlinkPath = await this.resolveHardlinkPath(accountDir, baseMd5, sessionId, createTime)
+      if (!this.isOperationCurrent(context)) return null
+      if (!hardlinkPath) continue
+      if (!allowThumbnail && !this.isHdDatPath(hardlinkPath)) continue
+      this.cacheDatPath(accountDir, baseMd5, hardlinkPath, context)
+      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, hardlinkPath, context)
+      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hardlinkPath, context)
+      const normalizedFileName = basename(hardlinkPath).toLowerCase()
+      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, hardlinkPath, context)
+      this.datNameScanMissAt.delete(missKey)
+      this.logInfo('[ImageDecrypt] dat scan selected (hardlink)', {
+        baseMd5,
+        selectedPath: hardlinkPath,
+        allowThumbnail
+      })
+      return hardlinkPath
     }
 
     if (!allowFilesystemScan) {
@@ -963,11 +992,22 @@ export class ImageDecryptService {
     }
 
     if (this.isOperationCurrent(context)) this.setDatNameScanMissAt(missKey, Date.now())
-    this.logInfo('[ImageDecrypt] resolveDatPath miss (dat scan)', {
+    const missSessionDir = sessionId ? this.resolveSessionDirForStorage(sessionId) : ''
+    const missMonthKey = this.resolveYearMonthFromCreateTime(createTime)
+    const missScanRoots = missSessionDir && missMonthKey ? [
+      join(accountDir, 'msg', 'attach', missSessionDir, missMonthKey, 'Img'),
+      join(accountDir, 'cache', missMonthKey, 'Message', missSessionDir, 'Bubble')
+    ] : []
+    this.logDiagnostic('resolveDatPath miss (dat scan)', {
+      accountDir,
+      sessionId,
+      createTime,
       imageMd5,
       imageDatName,
       lookupBases,
-      allowThumbnail
+      allowThumbnail,
+      scanRoots: missScanRoots,
+      scanRootsExist: missScanRoots.map((item) => ({ path: item, exists: existsSync(item) }))
     })
     return null
   }
@@ -1287,6 +1327,16 @@ export class ImageDecryptService {
     )
     if (baseDatAny) return baseDatAny
 
+    const bDatInImg = this.pickLargestDatPath(
+      imgCandidates.filter((item) => this.isBVariantDat(item))
+    )
+    if (bDatInImg) return bDatInImg
+
+    const bDatAny = this.pickLargestDatPath(
+      candidates.filter((item) => this.isBVariantDat(item))
+    )
+    if (bDatAny) return bDatAny
+
     const thumbDatInImg = this.pickLargestDatPath(
       imgCandidates.filter((item) => this.isTVariantDat(item))
     )
@@ -1446,7 +1496,9 @@ export class ImageDecryptService {
     const budget = { remaining: 240 }
     const targetDirs: Array<{ dir: string; depth: number }> = [
       // 1) accountDir/msg/attach/{sessionMd5}/{yyyy-MM}/Img
-      { dir: join(accountDir, 'msg', 'attach', sessionDir, monthKey, 'Img'), depth: 1 }
+      { dir: join(accountDir, 'msg', 'attach', sessionDir, monthKey, 'Img'), depth: 1 },
+      // 2) 新版消息缓存：accountDir/cache/{yyyy-MM}/Message/{sessionMd5}/Bubble
+      { dir: join(accountDir, 'cache', monthKey, 'Message', sessionDir, 'Bubble'), depth: 1 }
     ]
 
     for (const target of targetDirs) {
@@ -1581,41 +1633,103 @@ export class ImageDecryptService {
     return normalizedPath
   }
 
-  private async resolveHardlinkPath(accountDir: string, md5: string, _sessionId?: string): Promise<string | null> {
+  private async resolveHardlinkPath(
+    accountDir: string,
+    md5: string,
+    sessionId?: string,
+    createTime?: number
+  ): Promise<string | null> {
     try {
       const normalizedMd5 = String(md5 || '').trim().toLowerCase()
       if (!this.looksLikeMd5(normalizedMd5)) return null
       const ready = await this.ensureWcdbReady()
       if (!ready) {
-        this.logInfo('[ImageDecrypt] hardlink db not ready')
+        this.logDiagnostic('hardlink db not ready', { md5: normalizedMd5, accountDir })
         return null
       }
 
       const resolveResult = await wcdbService.resolveImageHardlink(normalizedMd5, accountDir)
-      if (!resolveResult.success || !resolveResult.data) return null
+      if (!resolveResult.success || !resolveResult.data) {
+        this.logDiagnostic('hardlink lookup miss', {
+          md5: normalizedMd5,
+          accountDir,
+          error: resolveResult.error
+        })
+        return null
+      }
       const fileName = String(resolveResult.data.file_name || '').trim()
       const fullPath = String(resolveResult.data.full_path || '').trim()
-      if (!fileName || !fullPath) return null
-
-      const lowerFileName = String(fileName).toLowerCase()
-      if (lowerFileName.endsWith('.dat')) {
-        const normalizedBase = this.normalizeDatBase(lowerFileName.slice(0, -4))
-        if (!this.looksLikeMd5(normalizedBase)) {
-          this.logInfo('[ImageDecrypt] hardlink fileName rejected', { fileName })
-          return null
-        }
+      const fileNameBase = fileName.toLowerCase().endsWith('.dat')
+        ? this.normalizeDatBase(fileName.toLowerCase().slice(0, -4))
+        : this.normalizeDatBase(fileName.toLowerCase())
+      const fileNameLooksLikeMd5 = this.looksLikeMd5(fileNameBase)
+      const fullPathExists = Boolean(fullPath && existsSync(fullPath))
+      this.logDiagnostic('hardlink result received', {
+        md5: normalizedMd5,
+        accountDir,
+        sessionId,
+        createTime,
+        fileName,
+        fullPath,
+        fileNameBase,
+        fileNameLooksLikeMd5,
+        fullPathExists,
+        resultKeys: Object.keys(resolveResult.data || {})
+      })
+      if (!fileName && !fullPath) {
+        this.logDiagnostic('hardlink result incomplete', {
+          md5: normalizedMd5,
+          accountDir,
+          fileName,
+          fullPath
+        })
+        return null
       }
 
-      const selectedPath = this.normalizeHardlinkDatPathByFileName(fullPath, fileName)
-      if (existsSync(selectedPath)) {
+      // hardlink.db 中的 full_path 可能指向旧的扁平缓存位置；新版微信实际文件
+      // 位于会话月份目录，文件名 token 与消息图片内容 MD5 不同。
+      const sessionCandidate = fileNameBase
+        ? this.selectBestDatPathByBase(accountDir, fileNameBase, sessionId, createTime, true)
+        : null
+      const selectedPath = sessionCandidate && existsSync(sessionCandidate)
+        ? sessionCandidate
+        : (fullPathExists ? fullPath : null)
+      this.logDiagnostic('hardlink path resolved', {
+        md5: normalizedMd5,
+        accountDir,
+        sessionId,
+        createTime,
+        fileName,
+        fileNameBase,
+        fileNameLooksLikeMd5,
+        fullPath,
+        fullPathExists,
+        sessionCandidate,
+        sessionCandidateExists: Boolean(sessionCandidate && existsSync(sessionCandidate)),
+        selectedPath,
+        selectedPathExists: Boolean(selectedPath && existsSync(selectedPath))
+      })
+      if (selectedPath && existsSync(selectedPath)) {
         this.logInfo('[ImageDecrypt] hardlink path hit', { md5: normalizedMd5, fileName, fullPath, selectedPath })
         return selectedPath
       }
 
-      this.logInfo('[ImageDecrypt] hardlink path miss', { md5: normalizedMd5, fileName, fullPath, selectedPath })
+      this.logDiagnostic('hardlink path miss', {
+        md5: normalizedMd5,
+        accountDir,
+        sessionId,
+        createTime,
+        fileName,
+        fileNameBase,
+        fileNameLooksLikeMd5,
+        fullPath,
+        fullPathExists,
+        sessionCandidate,
+        selectedPath
+      })
       return null
-    } catch {
-      // ignore
+    } catch (error) {
+      this.logError('解析图片 hardlink 异常', error, { md5, accountDir })
     }
     return null
   }
@@ -2179,16 +2293,18 @@ export class ImageDecryptService {
   ): Promise<{ data: Buffer; ext: string; isWxgf: boolean } | null> {
     // worker 线程内执行原生解密，避免滚动预载时批量同步调用阻塞主线程
     const result = await decryptDatViaNativeAsync(datPath, xorKey, aesKey)
+    const diagnostics = getNativeAddonDiagnostics()
     if (!this.nativeLogged) {
       this.nativeLogged = true
       if (result) {
         this.logInfo('Rust 原生解密已启用', {
-          addonPath: nativeAddonLocation(),
+          addonPath: diagnostics.resolvedPath || nativeAddonLocation(),
           source: 'native'
         })
       } else {
-        this.logInfo('Rust 原生解密不可用', {
-          addonPath: nativeAddonLocation(),
+        this.logError('Rust 原生解密不可用', undefined, {
+          addonPath: diagnostics.resolvedPath || nativeAddonLocation(),
+          error: diagnostics.error || 'unknown native error',
           source: 'native_unavailable'
         })
       }
@@ -2197,6 +2313,13 @@ export class ImageDecryptService {
     const fallback = await this.tryDecryptDatWithJs(datPath, xorKey, aesKey)
     if (fallback) {
       this.logInfo('JS DAT 解密 fallback 已启用', { datPath, ext: fallback.ext })
+    } else {
+      this.logError('媒体解密失败：原生插件与 JS fallback 均未产生有效图片', undefined, {
+        datPath,
+        addonPath: diagnostics.resolvedPath || nativeAddonLocation(),
+        hasAesKey: Boolean(aesKey),
+        nativeError: diagnostics.error || 'unknown native error'
+      })
     }
     return fallback
   }
@@ -2856,6 +2979,13 @@ export class ImageDecryptService {
     return this.isThumbnailDat(name)
   }
 
+  private isBVariantDat(datPath: string): boolean {
+    const name = basename(String(datPath || '')).toLowerCase()
+    if (!name.endsWith('.dat')) return false
+    const stem = name.slice(0, -4)
+    return stem.endsWith('_b') || stem.endsWith('.b')
+  }
+
   private isBaseDatPath(datPath: string, baseMd5: string): boolean {
     const normalizedBase = String(baseMd5 || '').trim().toLowerCase()
     if (!normalizedBase) return false
@@ -2865,7 +2995,7 @@ export class ImageDecryptService {
 
   private getDatTier(datPath: string, baseMd5: string): number {
     if (this.isHdDatPath(datPath)) return 3
-    if (this.isBaseDatPath(datPath, baseMd5)) return 2
+    if (this.isBaseDatPath(datPath, baseMd5) || this.isBVariantDat(datPath)) return 2
     if (this.isTVariantDat(datPath)) return 1
     return 0
   }
@@ -2878,6 +3008,7 @@ export class ImageDecryptService {
     if (normalized === '_t' || normalized === '.t' || normalized === '_thumb' || normalized === '.thumb') {
       return 1
     }
+    if (normalized === '_b' || normalized === '.b') return 2
     return 1
   }
 

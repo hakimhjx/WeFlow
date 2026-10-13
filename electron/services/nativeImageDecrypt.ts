@@ -35,6 +35,10 @@ type NativeAddon = {
 }
 
 let cachedAddon: NativeAddon | null | undefined
+let cachedAddonConfiguredPath: string | null | undefined
+let nativeLoadError: string | null = null
+let nativeDecryptError: string | null = null
+let workerError: string | null = null
 
 function shouldEnableNative(): boolean {
   return process.env.WEFLOW_IMAGE_NATIVE !== '0'
@@ -55,7 +59,15 @@ function expandAsarCandidates(filePath: string): string[] {
 let addonPathOverride: string | null | undefined
 
 export function setAddonPathOverride(path: string | null | undefined): void {
-  addonPathOverride = path && path.trim() ? path.trim() : null
+  const next = path && path.trim() ? path.trim() : null
+  if (next !== addonPathOverride) {
+    addonPathOverride = next
+    cachedAddon = undefined
+    cachedAddonConfiguredPath = undefined
+    nativeLoadError = null
+    nativeDecryptError = null
+    workerError = null
+  }
 }
 
 function getConfiguredAddonPath(): string | null {
@@ -75,25 +87,60 @@ function getAddonCandidates(): string[] {
 }
 
 function loadAddon(): NativeAddon | null {
-  if (!shouldEnableNative()) return null
-  if (cachedAddon !== undefined) return cachedAddon
+  if (!shouldEnableNative()) {
+    nativeLoadError = 'native addon disabled by WEFLOW_IMAGE_NATIVE=0'
+    return null
+  }
+  const configuredPath = getConfiguredAddonPath()
+  if (cachedAddon !== undefined && cachedAddonConfiguredPath === configuredPath) return cachedAddon
 
-  for (const candidate of getAddonCandidates()) {
-    if (!existsSync(candidate)) continue
+  const candidates = getAddonCandidates()
+  const errors: string[] = []
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) {
+      errors.push(`not found: ${candidate}`)
+      continue
+    }
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const addon = require(candidate) as NativeAddon
       if (addon && typeof addon.decryptDatNative === 'function') {
         cachedAddon = addon
+        cachedAddonConfiguredPath = configuredPath
+        nativeLoadError = null
         return addon
       }
-    } catch {
-      // try next candidate
+      errors.push(`missing decryptDatNative: ${candidate}`)
+    } catch (error) {
+      errors.push(`${candidate}: ${String(error)}`)
     }
   }
 
   cachedAddon = null
+  cachedAddonConfiguredPath = configuredPath
+  nativeLoadError = errors.length > 0 ? errors.join('; ') : 'imageNativeAddonPath is not configured'
   return null
+}
+
+export type NativeAddonDiagnostics = {
+  configuredPath: string | null
+  candidates: string[]
+  resolvedPath: string | null
+  loaded: boolean
+  error: string | null
+}
+
+export function getNativeAddonDiagnostics(): NativeAddonDiagnostics {
+  const configuredPath = getConfiguredAddonPath()
+  const candidates = getAddonCandidates()
+  const resolvedPath = candidates.find((candidate) => existsSync(candidate)) || null
+  return {
+    configuredPath,
+    candidates,
+    resolvedPath,
+    loaded: cachedAddon !== null && cachedAddon !== undefined,
+    error: nativeDecryptError || workerError || nativeLoadError
+  }
 }
 
 export function nativeAddonLocation(): string | null {
@@ -111,10 +158,14 @@ export function decryptDatViaNative(
   const addon = loadAddon()
   if (!addon) return null
 
+  nativeDecryptError = null
   try {
     const result = addon.decryptDatNative(inputPath, xorKey, aesKey)
     const isWxgf = Boolean(result?.isWxgf ?? result?.is_wxgf)
-    if (!result || !Buffer.isBuffer(result.data)) return null
+    if (!result || !Buffer.isBuffer(result.data)) {
+      nativeDecryptError = 'native addon returned an invalid result'
+      return null
+    }
     const rawExt = typeof result.ext === 'string' && result.ext.trim()
       ? result.ext.trim().toLowerCase()
       : ''
@@ -127,7 +178,8 @@ export function decryptDatViaNative(
       flag: result.flag
     }
     return { data: result.data, ext, isWxgf, meta }
-  } catch {
+  } catch (error) {
+    nativeDecryptError = String(error)
     return null
   }
 }
@@ -165,8 +217,8 @@ const pendingJobs = new Map<number, PendingJob>()
 function resolveWorkerPath(): string | null {
   const isDev = process.env.NODE_ENV === 'development'
   const candidates = isDev
-    ? [join(__dirname, '../dist-electron/imageDecryptWorker.js'), join(__dirname, 'imageDecryptWorker.js')]
-    : [join(__dirname, 'imageDecryptWorker.js')]
+    ? [join(__dirname, '../../dist-electron/imageDecryptWorker.js'), join(__dirname, '../dist-electron/imageDecryptWorker.js'), join(__dirname, 'imageDecryptWorker.js')]
+    : [join(__dirname, 'imageDecryptWorker.js'), join(process.cwd(), 'dist-electron/imageDecryptWorker.js')]
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate
   }
@@ -192,21 +244,24 @@ function ensureDecryptWorker(): Worker | null {
     const worker = new Worker(workerPath, {
       workerData: { resourcesPath: process.resourcesPath || '', imageNativeAddonPath: getConfiguredAddonPath() || '' }
     })
-    worker.on('message', (msg: { id: number; ok: boolean; addonMissing?: boolean; data?: ArrayBuffer; ext?: string; isWxgf?: boolean; meta?: NativeDatMeta }) => {
+    worker.on('message', (msg: { id: number; ok: boolean; addonMissing?: boolean; error?: string; data?: ArrayBuffer; ext?: string; isWxgf?: boolean; meta?: NativeDatMeta }) => {
       const job = pendingJobs.get(msg.id)
       if (!job) return
       pendingJobs.delete(msg.id)
       if (msg.addonMissing) {
         // worker 中找不到原生模块：停用 worker 路径，后续直接走主线程同步逻辑
+        workerError = msg.error || 'native addon was not found in worker'
         workerFailedPermanently = true
         terminateDecryptWorker()
         job.resolve(null)
         return
       }
       if (!msg.ok || !msg.data) {
+        workerError = msg.error || 'native worker returned no data'
         job.resolve(null)
         return
       }
+      workerError = null
       job.resolve({
         data: Buffer.from(msg.data),
         ext: msg.ext || '',
@@ -214,7 +269,8 @@ function ensureDecryptWorker(): Worker | null {
         meta: msg.meta || {}
       })
     })
-    const handleWorkerGone = () => {
+    const handleWorkerGone = (error?: Error | number) => {
+      if (error instanceof Error) workerError = String(error)
       flushPendingJobs()
       decryptWorker = null
     }

@@ -200,6 +200,15 @@ const FALLBACK_PROVIDERS: AIProviderCatalogEntry[] = [
     ...EMPTY_PRICING,
   },
   {
+    id: 'new-api', name: 'new-api', displayName: 'New API', description: '自部署聚合网关 · 支持 Codex 订阅渠道',
+    baseURL: '', protocol: 'openai-responses',
+    protocolOptions: ['openai-responses', 'openai-compatible'],
+    allowCustomBaseURL: true,
+    models: [],
+    providerType: 'third-party-relay',
+    ...EMPTY_PRICING,
+  },
+  {
     id: 'tianjige', name: 'tianjige', displayName: '天机阁', description: '三方中转 · OpenAI Compatible',
     baseURL: 'https://yujianwudi.top/v1', protocol: 'openai-compatible', allowCustomBaseURL: true,
     models: [],

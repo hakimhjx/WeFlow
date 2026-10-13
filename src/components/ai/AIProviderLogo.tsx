@@ -32,6 +32,7 @@ function normalizeProviderId(providerId?: string) {
   if (!providerId) return ''
   if (providerId === 'custom-responses') return 'openai'
   if (providerId === 'openai-compatible') return 'custom'
+  if (providerId === 'new-api') return 'custom'
   if (providerId === 'tianjige') return 'custom'
   if (providerId === 'relayone') return 'custom'
   if (providerId === 'google') return 'gemini'

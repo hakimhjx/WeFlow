@@ -1341,7 +1341,8 @@ export class WcdbCore {
         this.wcdbGetMonitorPipeName = this.lib.func('int32 wcdb_get_monitor_pipe_name(_Out_ void** outName)')
         this.writeLog('Monitor pipe functions loaded')
       } catch (e) {
-        console.warn('Failed to load monitor pipe functions:', e)
+        // monitor pipe 是可选能力，旧版 DLL 未导出时不应阻断数据库打开。
+        this.writeLog('[diag:monitor] optional monitor pipe API not exported: ' + String(e), true)
         this.wcdbStartMonitorPipe = null
         this.wcdbStopMonitorPipe = null
         this.wcdbGetMonitorPipeName = null
@@ -4403,9 +4404,75 @@ export class WcdbCore {
     }
   }
 
+  private quoteSqlIdentifier(value: string): string {
+    return `"${String(value || '').replace(/"/g, '""')}"`
+  }
+
+  private pickHardlinkField(row: Record<string, any>, names: string[]): string {
+    const keys = Object.keys(row || {})
+    for (const wanted of names) {
+      const key = keys.find((item) => item.toLowerCase() === wanted)
+      if (key && row[key] !== undefined && row[key] !== null) return String(row[key])
+    }
+    return ''
+  }
+
+  /**
+   * 旧版 weflow_wcdb.dll 没有 wcdb_resolve_image_hardlink 导出。
+   * 这里用现有只读 wcdb_exec_query 查询 hardlink.db，兼容旧 DLL 与新版随机文件名缓存。
+   */
+  private async resolveImageHardlinkByQuery(md5: string, accountDir: string): Promise<{ success: boolean; data?: any; error?: string }> {
+    const hardlinkDbPath = join(accountDir, 'db_storage', 'hardlink', 'hardlink.db')
+    this.writeLog(`[diag:hardlink-query] input md5=${md5} accountDir=${accountDir} hardlinkDbPath=${hardlinkDbPath} exists=${existsSync(hardlinkDbPath)}`, true)
+    const tableResult = await this.execQuery(
+      'hardlink',
+      hardlinkDbPath,
+      "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    )
+    if (!tableResult.success) return { success: false, error: tableResult.error || '读取 hardlink.db 表结构失败' }
+
+    const tableNames = (tableResult.rows || [])
+      .map((row: any) => String(row?.name || '').trim())
+      .filter(Boolean)
+    this.writeLog(`[diag:hardlink-query] schema tables=${tableNames.join(',') || '(none)'}`, true)
+    for (const tableName of tableNames) {
+      const probe = await this.execQuery(
+        'hardlink',
+        hardlinkDbPath,
+        `SELECT * FROM ${this.quoteSqlIdentifier(tableName)} LIMIT 5`
+      )
+      if (!probe.success || !Array.isArray(probe.rows) || probe.rows.length === 0) continue
+      const sample = probe.rows[0] as Record<string, any>
+      const sampleColumns = Object.keys(sample)
+      const md5Columns = sampleColumns.filter((key) => /md5|hash/i.test(key))
+      this.writeLog(`[diag:hardlink-query] table=${tableName} columns=${sampleColumns.join(',') || '(none)'} md5Columns=${md5Columns.join(',') || '(none)'}`, true)
+      for (const md5Column of md5Columns) {
+        const query = `SELECT * FROM ${this.quoteSqlIdentifier(tableName)} WHERE lower(${this.quoteSqlIdentifier(md5Column)}) = '${md5.toLowerCase()}' LIMIT 10`
+        const matched = await this.execQuery('hardlink', hardlinkDbPath, query)
+        if (!matched.success || !Array.isArray(matched.rows)) continue
+        for (const rawRow of matched.rows) {
+          const row = rawRow && typeof rawRow === 'object' ? rawRow as Record<string, any> : {}
+          const fileName = this.pickHardlinkField(row, ['file_name', 'filename', 'name'])
+          const fullPath = this.pickHardlinkField(row, ['full_path', 'file_path', 'filepath', 'path'])
+          this.writeLog(`[diag:hardlink-query] row table=${tableName} md5Column=${md5Column} rowKeys=${Object.keys(row).join(',') || '(none)'} fileName=${fileName || '(empty)'} fullPath=${fullPath || '(empty)'}`, true)
+          if (fileName || fullPath) {
+            return {
+              success: true,
+              data: {
+                file_name: fileName || (fullPath ? basename(fullPath) : ''),
+                full_path: fullPath || (fileName ? join(accountDir, fileName) : '')
+              }
+            }
+          }
+        }
+      }
+    }
+    this.writeLog(`[diag:hardlink-query] miss md5=${md5} hardlinkDbPath=${hardlinkDbPath}`, true)
+    return { success: false, error: 'hardlink.db 中未找到图片 MD5' }
+  }
+
   async resolveImageHardlink(md5: string, accountDir?: string): Promise<{ success: boolean; data?: any; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbResolveImageHardlink) return { success: false, error: '接口未就绪' }
     try {
       const normalizedMd5 = String(md5 || '').trim().toLowerCase()
       const normalizedAccountDir = String(accountDir || '').trim()
@@ -4414,14 +4481,18 @@ export class WcdbCore {
       const cached = this.readHardlinkCache(this.imageHardlinkCache, cacheKey)
       if (cached) return cached
 
-      const outPtr = [null as any]
-      const result = this.wcdbResolveImageHardlink(this.handle, normalizedMd5, normalizedAccountDir || null, outPtr)
-      if (result !== 0 || !outPtr[0]) return { success: false, error: `解析图片 hardlink 失败: ${result}` }
-      const jsonStr = this.decodeJsonPtr(outPtr[0])
-      if (!jsonStr) return { success: false, error: '解析图片 hardlink 响应失败' }
-      const data = JSON.parse(jsonStr) || {}
-      const finalResult = { success: true, data }
-      this.writeHardlinkCache(this.imageHardlinkCache, cacheKey, finalResult)
+      let finalResult: { success: boolean; data?: any; error?: string }
+      if (this.wcdbResolveImageHardlink) {
+        const outPtr = [null as any]
+        const result = this.wcdbResolveImageHardlink(this.handle, normalizedMd5, normalizedAccountDir || null, outPtr)
+        if (result !== 0 || !outPtr[0]) return { success: false, error: `解析图片 hardlink 失败: ${result}` }
+        const jsonStr = this.decodeJsonPtr(outPtr[0])
+        if (!jsonStr) return { success: false, error: '解析图片 hardlink 响应失败' }
+        finalResult = { success: true, data: JSON.parse(jsonStr) || {} }
+      } else {
+        finalResult = await this.resolveImageHardlinkByQuery(normalizedMd5, normalizedAccountDir)
+      }
+      if (finalResult.success) this.writeHardlinkCache(this.imageHardlinkCache, cacheKey, finalResult)
       return finalResult
     } catch (e) {
       return { success: false, error: String(e) }

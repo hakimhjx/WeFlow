@@ -1012,27 +1012,62 @@ export class ConfigService {
     return accountId ? this.cleanAccountDirName(accountId) : ''
   }
 
+  /** 读取旧版/外部工具写入的 wxidConfigs 密钥字段，仅用于兼容已有本地配置。 */
+  private getLegacyWxidImageKeys(accountId: string): { xorKey?: unknown; aesKey?: string } {
+    try {
+      const rawConfigs = this.store.get('wxidConfigs' as any) as Record<string, any> | undefined
+      if (!rawConfigs || typeof rawConfigs !== 'object') return {}
+      const cleanedAccountId = this.cleanAccountDirName(accountId)
+      const myWxid = String((this.store.get('myWxid' as any) as unknown as string) || '').trim()
+      const candidateIds = Array.from(new Set([accountId, cleanedAccountId, myWxid].filter(Boolean)))
+      for (const candidateId of candidateIds) {
+        const cfg = rawConfigs[candidateId]
+        if (!cfg || typeof cfg !== 'object') continue
+        const rawXor = cfg.imageXorKey
+        const rawAes = cfg.imageAesKey
+        const decodedXor = typeof rawXor === 'string' && rawXor.startsWith(SAFE_PREFIX)
+          ? this.safeDecrypt(rawXor)
+          : rawXor
+        const decodedAes = typeof rawAes === 'string' && rawAes.startsWith(SAFE_PREFIX)
+          ? this.safeDecrypt(rawAes)
+          : rawAes
+        const xorKey = typeof decodedXor === 'string' && decodedXor.trim() !== ''
+          ? Number(decodedXor)
+          : decodedXor
+        const aesKey = typeof decodedAes === 'string' ? decodedAes.trim() : ''
+        if ((xorKey !== undefined && xorKey !== null && Number.isFinite(Number(xorKey))) || aesKey) {
+          return { xorKey, aesKey: aesKey || undefined }
+        }
+      }
+    } catch {
+      // 旧配置损坏时继续使用标准 accountConfigs/全局配置。
+    }
+    return {}
+  }
+
   /**
-   * 获取当前 accountId 对应的图片密钥，优先从 accountConfigs 中取，找不到则回退到全局配置
+   * 获取当前 accountId 对应的图片密钥，优先从 accountConfigs 中取，找不到则回退到全局配置。
    */
   getImageKeysForCurrentAccountId(): { xorKey: unknown; aesKey: string } {
     const accountId = this.get('myAccountId')
+    const legacyKeys = this.getLegacyWxidImageKeys(accountId)
     if (accountId) {
       const accountConfigs = this.get('accountConfigs')
       const cfg = accountConfigs?.[accountId]
-      if (cfg && (cfg.imageXorKey !== undefined || cfg.imageAesKey)) {
+      const configuredXor = cfg?.imageXorKey !== undefined ? cfg.imageXorKey : legacyKeys.xorKey
+      const configuredAes = cfg?.imageAesKey || legacyKeys.aesKey
+      if (configuredXor !== undefined || configuredAes) {
         return {
-          xorKey: cfg.imageXorKey ?? this.get('imageXorKey'),
-          aesKey: cfg.imageAesKey ?? this.get('imageAesKey')
+          xorKey: configuredXor ?? this.get('imageXorKey'),
+          aesKey: configuredAes || this.get('imageAesKey')
         }
       }
     }
     return {
-      xorKey: this.get('imageXorKey'),
-      aesKey: this.get('imageAesKey')
+      xorKey: legacyKeys.xorKey ?? this.get('imageXorKey'),
+      aesKey: legacyKeys.aesKey || this.get('imageAesKey')
     }
   }
-
   /**
    * 清理账号目录名称（移除后缀）
    */

@@ -16,7 +16,7 @@
 import https from 'https'
 import http from 'http'
 import { URL } from 'url'
-import { generateText } from 'ai'
+import { generateText, streamText } from 'ai'
 import { ConfigService } from './config'
 import { createAgentModel } from './agentModelAdapter'
 import { chatService, ChatSession, Message } from './chatService'
@@ -601,21 +601,33 @@ class InsightService {
         ].join('\n')
       )
 
-      const result = await generateText({
-        model: createAgentModel({
-          provider,
-          protocol,
-          baseURL: apiBaseUrl,
-          apiKey,
-          model,
-          maxOutputTokens: normalizeApiMaxTokens(maxTokens),
-        }),
+      const testModel = createAgentModel({
+        provider,
+        protocol,
+        baseURL: apiBaseUrl,
+        apiKey,
+        model,
+        maxOutputTokens: normalizeApiMaxTokens(maxTokens),
+      })
+      const requestOptions = {
+        model: testModel,
         prompt: requestMessages[0].content,
         maxOutputTokens: Math.min(256, normalizeApiMaxTokens(maxTokens)),
         maxRetries: 0,
         abortSignal: controller.signal,
-      })
-      const output = String(result.text || '').trim()
+      }
+
+      let output = ''
+      if (provider === 'new-api' && protocol === 'openai-responses') {
+        // New API 的 Codex 订阅渠道只接受 stream=true。完整消费 textStream，
+        // 既能完成连接测试，也能避免连接在首个数据块后被提前取消。
+        const result = streamText(requestOptions)
+        for await (const delta of result.textStream) output += delta
+      } else {
+        const result = await generateText(requestOptions)
+        output = result.text
+      }
+      output = String(output || '').trim()
       if (!output) throw new Error('API 返回为空')
       insightDebugSection('INFO', 'AI 测试连接输出原文', output)
       return { success: true, message: `连接成功，模型回复：${output.slice(0, 50)}` }
@@ -696,6 +708,12 @@ class InsightService {
     }
     if (!this.isEnabled()) {
       return { success: false, message: '请先在设置中开启「AI 见解」' }
+    }
+    if (this.config.get('aiInsightAllowContext') !== true) {
+      return {
+        success: false,
+        message: '聊天上下文尚未授权。请在「设置 → AI 设置 → AI 见解」中开启“允许发送近期对话内容用于分析”后重试。'
+      }
     }
 
     const { apiBaseUrl, apiKey } = this.getSharedAiModelConfig()
@@ -1589,7 +1607,7 @@ ${afterText}
     if (!sessionId) return { success: false, message: '会话无效，无法生成见解' }
     if (!this.isEnabled()) return { success: false, message: '请先在设置中开启「AI 见解」' }
 
-    const { apiBaseUrl, apiKey, model, maxTokens } = this.getSharedAiModelConfig()
+    const { apiBaseUrl, apiKey, model, maxTokens, provider, protocol } = this.getSharedAiModelConfig()
     const allowContext = this.config.get('aiInsightAllowContext') as boolean
     const contextCount = (this.config.get('aiInsightContextCount') as number) || 40
     const resolvedDisplayName = await this.resolveInsightSessionDisplayName(sessionId, displayName)
@@ -1611,6 +1629,7 @@ ${afterText}
     // ── 构建 prompt ────────────────────────────────────────────────────────────
 
     let contextSection = ''
+    let contextReadError = ''
     if (allowContext) {
       try {
         const msgsResult = await chatService.getLatestMessages(sessionId, contextCount)
@@ -1618,9 +1637,21 @@ ${afterText}
           const messages: Message[] = msgsResult.messages
           contextSection = this.buildInsightContextSection(messages, resolvedDisplayName)
           insightLog('INFO', `已加载 ${messages.length} 条上下文消息`)
+        } else {
+          contextReadError = msgsResult.error || '该会话没有可发送的文本消息'
         }
       } catch (e) {
-        insightLog('WARN', `拉取上下文失败: ${(e as Error).message}`)
+        contextReadError = (e as Error).message || String(e)
+        insightLog('WARN', `拉取上下文失败: ${contextReadError}`)
+      }
+    }
+
+    if (triggerReason === 'manual' && !contextSection) {
+      return {
+        success: false,
+        message: allowContext
+          ? `未能读取近期聊天记录：${contextReadError || '没有可用消息'}`
+          : '聊天上下文尚未授权，请先在 AI 见解设置中开启“允许发送近期对话内容用于分析”'
       }
     }
 
@@ -1653,18 +1684,26 @@ ${afterText}
     ].filter(Boolean).join('\n\n')
     const userPrompt = appendPromptCurrentTime(userPromptBase)
 
-    const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
+    const endpoint = buildApiUrl(
+      apiBaseUrl,
+      protocol === 'openai-responses'
+        ? '/responses'
+        : protocol === 'anthropic'
+          ? '/messages'
+          : '/chat/completions'
+    )
     const requestMessages = [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt }
     ]
 
-    insightLog('INFO', `准备调用 API: ${endpoint}，模型: ${model}`)
+    insightLog('INFO', `准备调用 API: ${endpoint}，协议: ${protocol}，模型: ${model}`)
     insightDebugSection(
       'INFO',
       `AI 请求 ${resolvedDisplayName} (${sessionId})`,
       [
         `接口地址：${endpoint}`,
+        `接口协议：${protocol}`,
         `模型：${model}`,
         `Max Tokens：${maxTokens}`,
         `触发类型：${triggerReason}`,
@@ -1681,14 +1720,42 @@ ${afterText}
 
     try {
       const apiStartedAt = Date.now()
-      const result = await callApi(
-        apiBaseUrl,
-        apiKey,
-        model,
-        requestMessages,
-        API_TIMEOUT_MS,
-        maxTokens
-      )
+      let result = ''
+      if (protocol === 'openai-compatible') {
+        result = await callApi(
+          apiBaseUrl,
+          apiKey,
+          model,
+          requestMessages,
+          API_TIMEOUT_MS,
+          maxTokens
+        )
+      } else {
+        const requestOptions = {
+          model: createAgentModel({
+            provider,
+            protocol,
+            baseURL: apiBaseUrl,
+            apiKey,
+            model,
+            maxOutputTokens: normalizeApiMaxTokens(maxTokens),
+          }),
+          system: systemPrompt,
+          prompt: userPrompt,
+          maxOutputTokens: normalizeApiMaxTokens(maxTokens),
+          maxRetries: 0,
+        }
+        if (provider === 'new-api' && protocol === 'openai-responses') {
+          // New API 的 Codex 渠道要求 stream=true，必须完整读取响应流。
+          const response = streamText(requestOptions)
+          for await (const delta of response.textStream) result += delta
+        } else {
+          const response = await generateText(requestOptions)
+          result = response.text
+        }
+      }
+      result = String(result || '').trim()
+      if (!result) throw new Error('API 返回为空')
       const apiDurationMs = Date.now() - apiStartedAt
 
       insightLog('INFO', `API 返回原文: ${result.slice(0, 150)}`)

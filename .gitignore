@@ -76,6 +76,7 @@ pnpm-lock.yaml
 .codex
 weflow-web-offical
 /Wedecrypt
+/native/**
 /scripts/syncwcdb.py
 /scripts/syncWedecrypt.py
 /scripts/syncWelive.py

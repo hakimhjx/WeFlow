@@ -2929,22 +2929,7 @@ function registerIpcHandlers() {
   ipcMain.handle('agent:deleteMemory', async (_, id: string) => ({ success: agentService.memories.delete(String(id || '')) }))
 
   ipcMain.handle('chat:getMentionTargets', async (_, offset = 0, limit = 1000, keyword = '') => {
-    const result = await chatService.getSessions()
-    if (!result.success) return result
-    const normalizedKeyword = String(keyword || '').trim().toLowerCase()
-    const all = (result.sessions || [])
-      .filter((session) => !normalizedKeyword || `${session.displayName || ''} ${session.username || ''}`.toLowerCase().includes(normalizedKeyword))
-    const start = Math.max(0, Number(offset) || 0)
-    const size = Math.max(1, Math.min(Number(limit) || 1000, 1000))
-    return {
-      success: true,
-      sessions: all.slice(start, start + size).map((session) => ({
-        username: session.username,
-        displayName: session.displayName || session.username,
-        avatarUrl: session.avatarUrl,
-      })),
-      hasMore: start + size < all.length,
-    }
+    return chatService.getMentionTargets(offset, limit, keyword)
   })
 
   ipcMain.handle('file:writeBase64', async (_, filePath: string, base64: string) => {

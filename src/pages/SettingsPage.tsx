@@ -3494,7 +3494,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       {currentAiProvider?.protocolOptions && currentAiProvider.protocolOptions.length > 1 && (
         <div className="form-group">
           <label>接口协议</label>
-          <span className="form-hint">大多数第三方服务使用 OpenAI Compatible；只有服务商明确说明时才需要更换。</span>
+          <span className="form-hint">
+            {currentAiProvider.id === 'new-api'
+              ? 'Codex 订阅渠道请选择 OpenAI Responses；其他仅支持 Chat Completions 的渠道可切换为 OpenAI Compatible。'
+              : '大多数第三方服务使用 OpenAI Compatible；只有服务商明确说明时才需要更换。'}
+          </span>
           <AIThemedPicker
             ariaLabel="选择接口协议"
             className="ai-protocol-picker"
@@ -3519,7 +3523,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
           <div className="form-group">
             <label>基础地址（Base URL）</label>
             <span className="form-hint">
-              这是 AI 见解、足迹、Agent 与关系旅程共享的服务地址。内置供应商会自动填入，代理或聚合服务可以直接覆盖；末尾无需添加斜杠。
+              {currentAiProvider?.id === 'new-api'
+                ? '填写你的 New API 部署地址并保留 /v1，例如 https://new-api.example.com/v1；末尾无需添加斜杠。'
+                : '这是 AI 见解、足迹、Agent 与关系旅程共享的服务地址。内置供应商会自动填入，代理或聚合服务可以直接覆盖；末尾无需添加斜杠。'}
             </span>
             <input
               type="text"
@@ -3538,7 +3544,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
           <div className="form-group">
             <label>当前配置 API Key</label>
             <span className="form-hint">
-              每套配置的 API Key 都走与数据库密钥、图片密钥相同的系统安全存储；启用应用锁后还会随密钥一起改用锁密码派生加密，不会明文写入磁盘。
+              {currentAiProvider?.id === 'new-api'
+                ? '填写 New API 后台生成的令牌，不要填写 Codex OAuth 或订阅 access token。令牌会进入系统安全存储，不会明文写入磁盘。'
+                : '每套配置的 API Key 都走与数据库密钥、图片密钥相同的系统安全存储；启用应用锁后还会随密钥一起改用锁密码派生加密，不会明文写入磁盘。'}
             </span>
             <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
               <input

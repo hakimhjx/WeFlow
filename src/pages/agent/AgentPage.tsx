@@ -97,7 +97,7 @@ function nextEmptyCopyIndex(current: number, key: string): number {
   return storeRuntimeEmptyCopyIndex((current + offset) % EMPTY_PROMPT_LINES.length, key)
 }
 
-const MENTION_LOOKUP_LIMIT = 60
+const MENTION_LOOKUP_LIMIT = 30
 const MENTION_AVATAR_VISIBLE_LIMIT = 30
 const AGENT_MENTION_CACHE_TTL_MS = 5 * 60 * 1000
 const NO_AGENT_PROGRESS: AgentProgressEvent[] = []
@@ -210,6 +210,11 @@ const AGENT_RESUME_NOTICE = '回答已中断。已完成的工具调用和执行
 // 在本地有用，但不能证明提及目录已经加载。
 let cachedAgentMentionDirectoryTargets: MentionTarget[] = []
 let cachedAgentMentionDirectoryAt = 0
+
+type MentionPageState = {
+  loaded: number
+  hasMore: boolean
+}
 
 type AgentRuntimeSnapshot = {
   messages: UIMessage[]
@@ -408,6 +413,10 @@ export default function AgentPage({ active = true, routeSessionId: routeSessionI
   ))
   const [sessions, setSessions] = useState<MentionTarget[]>(() => initialMentionTargetsRef.current)
   const [mentionLoading, setMentionLoading] = useState(false)
+  const [mentionLoadingMore, setMentionLoadingMore] = useState(false)
+  const [mentionHasMore, setMentionHasMore] = useState(
+    () => initialMentionTargetsRef.current.length >= MENTION_LOOKUP_LIMIT,
+  )
   const [activeMentionQuery, setActiveMentionQuery] = useState<MentionInputQuery | null>(null)
   const [mentionSuggestionIndex, setMentionSuggestionIndex] = useState(0)
   const [modelConfig, setModelConfig] = useState<AgentModelConfig | null>(null)
@@ -493,6 +502,8 @@ export default function AgentPage({ active = true, routeSessionId: routeSessionI
   const selectionVersionRef = useRef(0)
   const mentionRequestVersionRef = useRef(0)
   const mentionLoadedQueriesRef = useRef(new Set<string>())
+  const mentionPageStateRef = useRef(new Map<string, MentionPageState>())
+  const mentionLoadingMoreQueriesRef = useRef(new Set<string>())
   const modelProvidersRef = useRef(modelProviders)
   const modelCatalogRequestRef = useRef<Promise<void> | null>(null)
   const modelConfigurationRequestRef = useRef(0)
@@ -902,76 +913,154 @@ export default function AgentPage({ active = true, routeSessionId: routeSessionI
     return false
   }
 
-  const loadMentionTargets = useCallback(async (query: string) => {
-    const normalizedQuery = query.trim().toLowerCase()
-    const cachedTargets = readCachedAgentMentionDirectoryTargets()
-    if (!normalizedQuery && cachedTargets.length > 0) {
-      mentionRequestVersionRef.current += 1
-      setMentionLoading(false)
-      setSessions(cachedTargets)
-      return
-    }
-    if (mentionLoadedQueriesRef.current.has(normalizedQuery)) return
-
-    const requestVersion = ++mentionRequestVersionRef.current
-    setMentionLoading(true)
-    try {
-      const sessionResult = await window.electronAPI.chat.getMentionTargets(0, MENTION_LOOKUP_LIMIT, normalizedQuery)
-      if (requestVersion !== mentionRequestVersionRef.current) return
-      const fetchedTargets = sessionResult.success && Array.isArray(sessionResult.sessions)
-        ? sessionResult.sessions.map((item) => toMentionTarget(item.username, item.displayName, item.avatarUrl))
-        : []
-      mentionLoadedQueriesRef.current.add(normalizedQuery)
-      if (!normalizedQuery) writeCachedAgentMentionDirectoryTargets(fetchedTargets)
-      setSessions((current) => {
-        const next = mergeMentionTargetLists(current, fetchedTargets)
+  const applyMentionTargetDetails = useCallback((details: Map<string, MentionTarget>, persistRecentPage: boolean) => {
+    if (details.size === 0) return
+    const mergeDetails = (targets: MentionTarget[]) => targets.map((target) => {
+      const detail = details.get(target.username)
+      return detail ? mergeMentionTarget(target, detail) : target
+    })
+    setSessions((current) => mergeDetails(current))
+    setMentions((current) => {
+      const next = mergeDetails(current)
+      if (next.some((target, index) => target !== current[index])) {
+        scopeRef.current = scopeForMentions(next)
         return next
-      })
+      }
+      return current
+    })
+    if (persistRecentPage) {
+      const cachedTargets = readCachedAgentMentionDirectoryTargets()
+      if (cachedTargets.length > 0) writeCachedAgentMentionDirectoryTargets(mergeDetails(cachedTargets))
+    }
+  }, [])
 
-      const avatarTargets = fetchedTargets
+  const enrichMentionTargetPage = useCallback((targets: MentionTarget[], persistRecentPage: boolean) => {
+    const usernames = targets.map((target) => target.username)
+    if (usernames.length === 0) return
+
+    // Resolve names first. Avatar lookup (including head_image.db fallback) is
+    // started afterwards and never blocks the directory or its paging state.
+    void (async () => {
+      try {
+        const names = await window.electronAPI.chat.refreshSessionContactDisplayNames(usernames)
+        if (names.success && names.contacts) {
+          const details = new Map<string, MentionTarget>()
+          for (const [username, detail] of Object.entries(names.contacts)) {
+            details.set(username, toMentionTarget(username, detail.displayName, detail.avatarUrl))
+          }
+          applyMentionTargetDetails(details, persistRecentPage)
+        }
+      } catch (error) {
+        console.error('加载 Agent 联系人名称失败:', error)
+      }
+
+      const avatarTargets = targets
         .filter((target) => !target.avatarUrl)
         .slice(0, MENTION_AVATAR_VISIBLE_LIMIT)
       if (avatarTargets.length === 0) return
-      const enriched = await window.electronAPI.chat.enrichSessionsContactInfo(
-        avatarTargets.map((target) => target.username),
-        { onlyMissingAvatar: true },
+      try {
+        const avatars = await window.electronAPI.chat.enrichSessionsContactInfo(
+          avatarTargets.map((target) => target.username),
+          { skipDisplayName: true, onlyMissingAvatar: true },
+        )
+        if (!avatars.success || !avatars.contacts) return
+        const details = new Map<string, MentionTarget>()
+        for (const [username, detail] of Object.entries(avatars.contacts)) {
+          details.set(username, toMentionTarget(username, detail.displayName, detail.avatarUrl))
+        }
+        applyMentionTargetDetails(details, persistRecentPage)
+      } catch (error) {
+        console.error('后台加载 Agent 联系人头像失败:', error)
+      }
+    })()
+  }, [applyMentionTargetDetails])
+
+  const loadMentionTargets = useCallback(async (query: string, options?: { append?: boolean }) => {
+    const normalizedQuery = query.trim().toLowerCase()
+    const append = options?.append === true
+    const existingPage = mentionPageStateRef.current.get(normalizedQuery)
+
+    if (append) {
+      if (!existingPage?.hasMore || mentionLoadingMoreQueriesRef.current.has(normalizedQuery)) return
+    } else {
+      const cachedTargets = readCachedAgentMentionDirectoryTargets()
+      if (!normalizedQuery && cachedTargets.length > 0) {
+        mentionRequestVersionRef.current += 1
+        const page = {
+          loaded: cachedTargets.length,
+          hasMore: cachedTargets.length >= MENTION_LOOKUP_LIMIT,
+        }
+        mentionPageStateRef.current.set(normalizedQuery, page)
+        mentionLoadedQueriesRef.current.add(normalizedQuery)
+        setMentionLoading(false)
+        setMentionHasMore(page.hasMore)
+        setSessions((current) => mergeMentionTargetLists(current, cachedTargets))
+        return
+      }
+      if (mentionLoadedQueriesRef.current.has(normalizedQuery)) {
+        setMentionHasMore(existingPage?.hasMore === true)
+        return
+      }
+    }
+
+    const offset = append ? existingPage?.loaded || 0 : 0
+    const requestVersion = append ? mentionRequestVersionRef.current : ++mentionRequestVersionRef.current
+    if (append) {
+      mentionLoadingMoreQueriesRef.current.add(normalizedQuery)
+      setMentionLoadingMore(true)
+    } else {
+      setMentionLoading(true)
+      setMentionHasMore(false)
+    }
+
+    try {
+      const sessionResult = await window.electronAPI.chat.getMentionTargets(
+        offset,
+        MENTION_LOOKUP_LIMIT,
+        normalizedQuery,
       )
-      if (requestVersion !== mentionRequestVersionRef.current || !enriched.success || !enriched.contacts) return
-      const details = new Map<string, MentionTarget>()
-      for (const [username, detail] of Object.entries(enriched.contacts)) {
-        details.set(username, toMentionTarget(username, detail.displayName, detail.avatarUrl))
+      if (requestVersion !== mentionRequestVersionRef.current) return
+      if (!sessionResult.success || !Array.isArray(sessionResult.sessions)) {
+        throw new Error(sessionResult.error || '加载联系人失败')
       }
+      const fetchedTargets = sessionResult.sessions.map((item) => (
+        toMentionTarget(item.username, item.displayName, item.avatarUrl)
+      ))
+      const page = {
+        loaded: offset + fetchedTargets.length,
+        hasMore: sessionResult.hasMore === true,
+      }
+      mentionPageStateRef.current.set(normalizedQuery, page)
+      mentionLoadedQueriesRef.current.add(normalizedQuery)
+      setMentionHasMore(page.hasMore)
+      setSessions((current) => mergeMentionTargetLists(current, fetchedTargets))
+
       if (!normalizedQuery) {
-        writeCachedAgentMentionDirectoryTargets(fetchedTargets.map((target) => {
-          const detail = details.get(target.username)
-          return detail ? mergeMentionTarget(target, detail) : target
-        }))
+        const cachedTargets = append
+          ? mergeMentionTargetLists(readCachedAgentMentionDirectoryTargets(), fetchedTargets)
+          : fetchedTargets
+        writeCachedAgentMentionDirectoryTargets(cachedTargets)
       }
-      setSessions((current) => {
-        const next = current.map((target) => {
-          const detail = details.get(target.username)
-          return detail ? mergeMentionTarget(target, detail) : target
-        })
-        return next
-      })
-      setMentions((current) => {
-        let changed = false
-        const next = current.map((target) => {
-          const detail = details.get(target.username)
-          if (!detail) return target
-          const merged = mergeMentionTarget(target, detail)
-          if (merged !== target) changed = true
-          return merged
-        })
-        if (changed) scopeRef.current = scopeForMentions(next)
-        return changed ? next : current
-      })
+
+      // The page can be used as soon as its session names arrive. Contact-name
+      // correction and avatar work continue independently in the background.
+      if (!append) setMentionLoading(false)
+      enrichMentionTargetPage(fetchedTargets, !normalizedQuery)
     } catch (error) {
       if (requestVersion === mentionRequestVersionRef.current) console.error('加载 Agent 提及对象失败:', error)
     } finally {
-      if (requestVersion === mentionRequestVersionRef.current) setMentionLoading(false)
+      if (append) {
+        mentionLoadingMoreQueriesRef.current.delete(normalizedQuery)
+        setMentionLoadingMore(mentionLoadingMoreQueriesRef.current.size > 0)
+      } else if (requestVersion === mentionRequestVersionRef.current) {
+        setMentionLoading(false)
+      }
     }
-  }, [])
+  }, [enrichMentionTargetPage])
+
+  const loadMoreMentionTargets = useCallback((query: string) => {
+    void loadMentionTargets(query, { append: true })
+  }, [loadMentionTargets])
   const mentionTargetsById = useMemo(
     () => new Map(sessions.map((target) => [target.username, target])),
     [sessions],
@@ -2297,9 +2386,12 @@ export default function AgentPage({ active = true, routeSessionId: routeSessionI
                 {activeMentionQuery && (
                   <MentionTypeahead
                     activeIndex={Math.min(mentionSuggestionIndex, Math.max(mentionTypeaheadTargets.length - 1, 0))}
+                    hasMore={mentionHasMore}
                     isLoading={mentionLoading}
+                    isLoadingMore={mentionLoadingMore}
                     onActiveIndexChange={setMentionSuggestionIndex}
                     onDismiss={dismissMentionTypeahead}
+                    onLoadMore={(query) => loadMoreMentionTargets(mentionLookupQuery(query))}
                     onSelect={(target) => insertMentionAtCursor(target, activeMentionQuery)}
                     query={activeMentionQuery.query}
                     sessions={sessions}
@@ -2324,9 +2416,12 @@ export default function AgentPage({ active = true, routeSessionId: routeSessionI
                       )}
                     >
                       <MentionTriggerButton
+                        hasMore={mentionHasMore}
                         mentions={mentions}
                         sessions={sessions}
                         isLoading={mentionLoading}
+                        isLoadingMore={mentionLoadingMore}
+                        onLoadMore={loadMoreMentionTargets}
                         onRequest={loadMentionTargets}
                         onAdd={insertMentionAtCursor}
                       />

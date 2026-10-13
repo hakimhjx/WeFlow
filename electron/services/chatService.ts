@@ -502,6 +502,18 @@ class ChatService {
   private readonly sessionDetailExtraCacheTtlMs = 5 * 60 * 1000
   private sessionStatusCache = new Map<string, { isFolded?: boolean; isMuted?: boolean; updatedAt: number }>()
   private readonly sessionStatusCacheTtlMs = 10 * 60 * 1000
+  private mentionTargetsDirectoryCache: {
+    accountScope: string
+    accountEpoch: number
+    sessions: ChatSession[]
+    updatedAt: number
+  } | null = null
+  private mentionTargetsDirectoryPending: {
+    accountScope: string
+    accountEpoch: number
+    promise: Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }>
+  } | null = null
+  private readonly mentionTargetsDirectoryCacheTtlMs = 2 * 60 * 1000
   private sessionStatsCacheScope = ''
   private sessionStatsMemoryCache = new Map<string, SessionStatsCacheEntry>()
   private sessionStatsPendingBasic = new Map<string, Promise<ExportSessionStats>>()
@@ -1215,7 +1227,7 @@ class ChatService {
   /**
    * 获取会话列表（优化：先返回基础数据，不等待联系人信息加载）
    */
-  async getSessions(): Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }> {
+  async getSessions(options?: { includeMissingOfficialSessions?: boolean }): Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }> {
     try {
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) {
@@ -1376,9 +1388,11 @@ class ChatService {
         }
       }
 
-      await this.addMissingOfficialSessions(sessions, myAccountId, accountScope, accountCacheEpoch)
-      if (!isCurrentAccount()) {
-        return { success: false, error: '账号已切换，已丢弃过期会话结果' }
+      if (options?.includeMissingOfficialSessions !== false) {
+        await this.addMissingOfficialSessions(sessions, myAccountId, accountScope, accountCacheEpoch)
+        if (!isCurrentAccount()) {
+          return { success: false, error: '账号已切换，已丢弃过期会话结果' }
+        }
       }
       if (ENABLE_OFFICIAL_SESSION_UNREAD_SCAN) {
         await this.applySyntheticUnreadCounts(sessions, accountScope, accountCacheEpoch)
@@ -1397,6 +1411,93 @@ class ChatService {
     } catch (e) {
       console.error('ChatService: 获取会话列表失败:', e)
       return { success: false, error: String(e) }
+    }
+  }
+
+  /**
+   * Agent mention directory. The UI sends a request for each search prefix, so
+   * coalesce the initial full session scan and filter the short-lived snapshot
+   * in memory instead of rescanning session.db/contact.db on every keystroke.
+   */
+  async getMentionTargets(
+    offset: number = 0,
+    limit: number = 1000,
+    keyword: string = ''
+  ): Promise<{
+    success: boolean
+    sessions?: Array<{ username: string; displayName: string; avatarUrl?: string }>
+    hasMore?: boolean
+    error?: string
+  }> {
+    const connectResult = await this.ensureConnected()
+    if (!connectResult.success) {
+      return { success: false, error: connectResult.error }
+    }
+    const accountScope = this.getCacheAccountScope()
+    const accountEpoch = this.accountCacheEpoch
+    const now = Date.now()
+    let directory: ChatSession[] | undefined
+
+    const cached = this.mentionTargetsDirectoryCache
+    if (
+      cached &&
+      cached.accountScope === accountScope &&
+      cached.accountEpoch === accountEpoch &&
+      now - cached.updatedAt <= this.mentionTargetsDirectoryCacheTtlMs
+    ) {
+      directory = cached.sessions
+    } else {
+      let pending = this.mentionTargetsDirectoryPending
+      if (!pending || pending.accountScope !== accountScope || pending.accountEpoch !== accountEpoch) {
+        // Agent mentions only need existing conversations. Filling in official
+        // accounts without sessions scans the entire contact database and adds
+        // substantial latency without making regular friends searchable.
+        const promise = this.getSessions({ includeMissingOfficialSessions: false })
+        pending = { accountScope, accountEpoch, promise }
+        this.mentionTargetsDirectoryPending = pending
+        const clearPending = () => {
+          if (this.mentionTargetsDirectoryPending?.promise === promise) {
+            this.mentionTargetsDirectoryPending = null
+          }
+        }
+        void promise.then(clearPending, clearPending)
+      }
+      const result = await pending.promise
+      if (!result.success || !Array.isArray(result.sessions)) {
+        return { success: false, error: result.error || '获取联系人目录失败' }
+      }
+      if (!this.isAccountCacheContextCurrent(accountScope, accountEpoch)) {
+        return { success: false, error: '账号已切换，已丢弃过期联系人目录' }
+      }
+      directory = result.sessions
+      this.mentionTargetsDirectoryCache = {
+        accountScope,
+        accountEpoch,
+        sessions: directory,
+        updatedAt: Date.now()
+      }
+    }
+
+    const normalizedKeyword = String(keyword || '').trim().toLowerCase()
+    const filtered = directory.filter((session) => {
+      if (!normalizedKeyword) return true
+      const cachedContact = this.avatarCache.get(session.username)
+      const displayName = cachedContact?.displayName || session.displayName || session.username
+      return `${displayName} ${session.username}`.toLowerCase().includes(normalizedKeyword)
+    })
+    const start = Math.max(0, Math.floor(Number(offset) || 0))
+    const size = Math.max(1, Math.min(Math.floor(Number(limit) || 1000), 1000))
+    return {
+      success: true,
+      sessions: filtered.slice(start, start + size).map((session) => {
+        const cachedContact = this.avatarCache.get(session.username)
+        return {
+          username: session.username,
+          displayName: cachedContact?.displayName || session.displayName || session.username,
+          avatarUrl: cachedContact?.avatarUrl || session.avatarUrl
+        }
+      }),
+      hasMore: start + size < filtered.length
     }
   }
 
@@ -2073,13 +2174,10 @@ class ChatService {
 
       // 批量查询缺失的联系人信息
       if (missing.length > 0) {
-        const displayNames = skipDisplayName
-          ? null
-          : await wcdbService.getDisplayNames(missing)
-        if (!this.isAccountCacheContextCurrent(cacheAccountScope, accountCacheEpoch)) {
-          return { success: false, error: '账号已切换，已丢弃过期联系人结果' }
-        }
-        const avatarUrls = await wcdbService.getAvatarUrls(missing)
+        const [displayNames, avatarUrls] = await Promise.all([
+          skipDisplayName ? Promise.resolve(null) : wcdbService.getDisplayNames(missing),
+          wcdbService.getAvatarUrls(missing)
+        ])
         if (!this.isAccountCacheContextCurrent(cacheAccountScope, accountCacheEpoch)) {
           return { success: false, error: '账号已切换，已丢弃过期联系人结果' }
         }
